@@ -10,7 +10,7 @@ export default {
       return json(
         {
           error: "Claude API key is not configured",
-          hint: "Set ANTHROPIC_API_KEY as a Worker secret"
+          hint: "Set ANTHROPIC_API_KEY as a Worker secret named ANTHROPIC_API_KEY"
         },
         500
       );
@@ -30,48 +30,53 @@ export default {
       const form = await request.formData();
       const file = form.get("image");
 
-      if (!file || !file.arrayBuffer) {
+      if (!file || typeof file.arrayBuffer !== "function") {
         return json(
           { error: "No image uploaded (field name must be 'image')." },
           400
         );
       }
 
+      // Optional: prevent huge uploads (helps avoid memory issues)
+      const maxBytes = 5 * 1024 * 1024; // 5MB
+      if (typeof file.size === "number" && file.size > maxBytes) {
+        return json(
+          { error: `Image is too large. Please use an image under ${maxBytes} bytes (~5MB).` },
+          400
+        );
+      }
+
       const bytes = new Uint8Array(await file.arrayBuffer());
 
-      // ---- Convert image to base64 ----
-      const base64 = btoa(
-        Array.from(bytes, (b) => String.fromCharCode(b)).join("")
-      );
+      // ---- Convert image to base64 (chunked, reliable) ----
+      const base64 = bytesToBase64(bytes);
 
       // ---- Call Claude Vision ----
-      const response = await fetch(
-        "https://api.anthropic.com/v1/messages",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": env.ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01"
-          },
-          body: JSON.stringify({
-            model: "claude-3-5-sonnet-latest",
-            max_tokens: 500,
-            messages: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "image",
-                    source: {
-                      type: "base64",
-                      media_type: file.type || "image/jpeg",
-                      data: base64
-                    }
-                  },
-                  {
-                    type: "text",
-                    text: `You are a Squishmallow expert.
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({
+          model: "claude-3-5-sonnet-latest",
+          max_tokens: 500,
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "image",
+                  source: {
+                    type: "base64",
+                    media_type: file.type || "image/jpeg",
+                    data: base64
+                  }
+                },
+                {
+                  type: "text",
+                  text: `You are a Squishmallow expert.
 
 Identify the Squishmallow in the photo.
 
@@ -93,20 +98,16 @@ Respond ONLY in valid JSON with this shape:
 
 If you are unsure, lower the confidence and explain politely.
 Make it kid-friendly.`
-                  }
-                ]
-              }
-            ]
-          })
-        }
-      );
+                }
+              ]
+            }
+          ]
+        })
+      });
 
       if (!response.ok) {
         const text = await response.text();
-        return json(
-          { error: "Claude API error", details: text },
-          500
-        );
+        return json({ error: "Claude API error", details: text }, 500);
       }
 
       const result = await response.json();
@@ -117,28 +118,35 @@ Make it kid-friendly.`
         parsed = JSON.parse(textBlock);
       } catch {
         return json(
-          {
-            error: "Could not parse Claude response",
-            raw: textBlock
-          },
+          { error: "Could not parse Claude response", raw: textBlock },
           500
         );
       }
 
       return json(parsed);
-
     } catch (err) {
       // ---- Final safety net ----
       return json(
         {
           error: "Worker crashed",
-          message: err.message
+          message: err?.message || String(err)
         },
         500
       );
     }
   }
 };
+
+// ---- Base64 helper (chunked to avoid large-string failures) ----
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunkSize = 0x8000; // 32KB chunks
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
 
 // ---- Helpers ----
 function cors() {
