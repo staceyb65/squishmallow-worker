@@ -1,8 +1,34 @@
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+
     // ---- CORS preflight ----
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: cors() });
+    }
+
+    // ---- Debug: list models available to THIS API key ----
+    // Visit: https://YOUR-WORKER.workers.dev/models
+    if (request.method === "GET" && url.pathname === "/models") {
+      if (!env.ANTHROPIC_API_KEY) {
+        return json(
+          { error: "Missing ANTHROPIC_API_KEY secret in Worker settings." },
+          500
+        );
+      }
+
+      const r = await fetch("https://api.anthropic.com/v1/models", {
+        headers: {
+          "x-api-key": env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01"
+        }
+      });
+
+      const text = await r.text();
+      return new Response(text, {
+        status: r.status,
+        headers: { "Content-Type": "application/json", ...cors() }
+      });
     }
 
     // ---- Guard: API key must exist ----
@@ -10,14 +36,15 @@ export default {
       return json(
         {
           error: "Claude API key is not configured",
-          hint: "Set ANTHROPIC_API_KEY as a Worker secret named ANTHROPIC_API_KEY"
+          hint: "Set ANTHROPIC_API_KEY as a Worker secret"
         },
         500
       );
     }
 
+    // ---- Only allow POST for image analysis ----
     if (request.method !== "POST") {
-      return json({ error: "Use POST with an image." }, 405);
+      return json({ error: "Use POST with an image (FormData field: image)." }, 405);
     }
 
     const contentType = request.headers.get("content-type") || "";
@@ -41,7 +68,7 @@ export default {
       const maxBytes = 5 * 1024 * 1024; // 5MB
       if (typeof file.size === "number" && file.size > maxBytes) {
         return json(
-          { error: `Image is too large. Please use an image under ${maxBytes} bytes (~5MB).` },
+          { error: `Image is too large. Please use an image under ~5MB.` },
           400
         );
       }
@@ -51,17 +78,23 @@ export default {
       // ---- Convert image to base64 (chunked, reliable) ----
       const base64 = bytesToBase64(bytes);
 
-      // ---- Call Claude Vision ----
+      // ---- Choose a model ----
+      // Default to a current Sonnet model ID from Anthropic docs.
+      // If you get "model not found", open /models and copy an ID from there.
+      const MODEL_ID = "claude-sonnet-4-6";
+
+      // ---- Call Claude (Messages API) ----
       const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "x-api-key": env.ANTHROPIC_API_KEY,
-          "anthropic-version": "2023-06-01",
-          "anthropic-beta": "vision-2024-01-31"
+          "anthropic-version": "2023-06-01"
+          // NOTE: NO anthropic-beta header here.
+          // Beta headers must be valid documented flags; invalid ones are rejected. [1](https://platform.claude.com/docs/en/api/models/list)
         },
         body: JSON.stringify({
-          model: "claude-sonnet-4-6",
+          model: MODEL_ID,
           max_tokens: 500,
           messages: [
             {
@@ -119,14 +152,13 @@ Make it kid-friendly.`
         parsed = JSON.parse(textBlock);
       } catch {
         return json(
-          { error: "Could not parse Claude response", raw: textBlock },
+          { error: "Could not parse Claude response as JSON", raw: textBlock },
           500
         );
       }
 
       return json(parsed);
     } catch (err) {
-      // ---- Final safety net ----
       return json(
         {
           error: "Worker crashed",
@@ -141,7 +173,7 @@ Make it kid-friendly.`
 // ---- Base64 helper (chunked to avoid large-string failures) ----
 function bytesToBase64(bytes) {
   let binary = "";
-  const chunkSize = 0x8000; // 32KB chunks
+  const chunkSize = 0x8000; // 32KB
   for (let i = 0; i < bytes.length; i += chunkSize) {
     const chunk = bytes.subarray(i, i + chunkSize);
     binary += String.fromCharCode(...chunk);
@@ -153,7 +185,7 @@ function bytesToBase64(bytes) {
 function cors() {
   return {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
     "Access-Control-Allow-Headers": "Content-Type"
   };
 }
