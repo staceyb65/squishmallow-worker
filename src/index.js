@@ -58,6 +58,7 @@ export default {
           "Content-Type": "application/json",
           "x-api-key": env.ANTHROPIC_API_KEY,
           "anthropic-version": "2023-06-01"
+          "anthropic-beta": "vision-2024-01-31"
         },
         body: JSON.stringify({
           model: "claude-3-sonnet-20240229",
