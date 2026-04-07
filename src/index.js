@@ -1,11 +1,11 @@
 export default {
   async fetch(request, env) {
-    // --- CORS ---
+    // ---- CORS preflight ----
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: cors() });
     }
 
-    // ✅ Guard: API key must exist
+    // ---- Guard: API key must exist ----
     if (!env.ANTHROPIC_API_KEY) {
       return json(
         {
@@ -25,26 +25,26 @@ export default {
       return json({ error: "Expected multipart/form-data." }, 400);
     }
 
-    const form = await request.formData();
-    const file = form.get("image");
-
-    if (!file || !file.arrayBuffer) {
-      return json(
-        { error: "No image uploaded (field name must be 'image')." },
-        400
-      );
-    }
-
     try {
-      // --- Read image bytes ---
+      // ---- Read uploaded image ----
+      const form = await request.formData();
+      const file = form.get("image");
+
+      if (!file || !file.arrayBuffer) {
+        return json(
+          { error: "No image uploaded (field name must be 'image')." },
+          400
+        );
+      }
+
       const bytes = new Uint8Array(await file.arrayBuffer());
 
-      // Convert to base64 for Claude
+      // ---- Convert image to base64 ----
       const base64 = btoa(
         Array.from(bytes, (b) => String.fromCharCode(b)).join("")
       );
 
-      // --- Claude Vision request ---
+      // ---- Call Claude Vision ----
       const response = await fetch(
         "https://api.anthropic.com/v1/messages",
         {
@@ -72,6 +72,7 @@ export default {
                   {
                     type: "text",
                     text: `You are a Squishmallow expert.
+
 Identify the Squishmallow in the photo.
 
 Respond ONLY in valid JSON with this shape:
@@ -90,8 +91,8 @@ Respond ONLY in valid JSON with this shape:
   ]
 }
 
-If unsure, lower the confidence and explain politely.
-Make it kid‑friendly.`
+If you are unsure, lower the confidence and explain politely.
+Make it kid-friendly.`
                   }
                 ]
               }
@@ -127,7 +128,7 @@ Make it kid‑friendly.`
       return json(parsed);
 
     } catch (err) {
-      // ✅ Final safety net — never crash the Worker
+      // ---- Final safety net ----
       return json(
         {
           error: "Worker crashed",
