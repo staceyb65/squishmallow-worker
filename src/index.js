@@ -61,7 +61,7 @@ export default {
           "anthropic-beta": "vision-2024-01-31"
         },
         body: JSON.stringify({
-          model: "claude-3-sonnet-20240229",
+          model: "claude-sonnet-4-6",
           max_tokens: 500,
           messages: [
             {
