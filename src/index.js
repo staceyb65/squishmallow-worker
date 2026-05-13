@@ -43,7 +43,6 @@ export default {
     }
 
     // ---- Route: IDENTIFY (multipart/form-data image) ----
-    // Default: POST / (or any other non-/story path) is identify
     if (request.method !== "POST") {
       return json(
         { error: "Use POST / for identify (multipart) or POST /story for story (JSON)." },
@@ -139,17 +138,16 @@ JSON schema (must match exactly):
 
     const result = await response.json();
     const textBlock = result.content?.[0]?.text || "";
-    const extracted = extractJson(textBlock);
 
     let parsed;
     try {
-      parsed = JSON.parse(extracted);
-    } catch {
+      parsed = parseClaudeJson(textBlock);
+    } catch (e) {
       return json(
         {
           error: "Could not parse Claude response as JSON",
           raw: textBlock,
-          extracted,
+          message: e.message,
         },
         500
       );
@@ -173,135 +171,51 @@ async function handleStory(request, env) {
     const theme = (body.theme || "adventure").trim();
     const seed = String(body.regenerate_seed || Date.now()).trim();
 
-    if (!squishName) {
-      return json({ error: "Missing squish_name." }, 400);
-    }
+    if (!squishName) return json({ error: "Missing squish_name." }, 400);
     if (!["K", "1", "2", "3", "4", "5", "6"].includes(grade)) {
       return json({ error: "grade_level must be K,1,2,3,4,5,6." }, 400);
     }
 
     const MODEL_ID = "claude-sonnet-4-6";
 
-    // Spring benchmark WCPM (50th percentile) for grades 1–6 (Hasbrouck & Tindal 2017 norms). [1](https://readingxr.com/child-instructional-recommendations/)[2](https://brighterly.com/blog/reading-speed-by-age/)
-    const springWCPM50 = {
-      "1": 60,
-      "2": 100,
-      "3": 112,
-      "4": 133,
-      "5": 146,
-      "6": 146,
-    };
+    // Spring benchmark WCPM (50th percentile) for grades 1–6
+    const springWCPM50 = { "1": 60, "2": 100, "3": 112, "4": 133, "5": 146, "6": 146 };
 
-    // Constraints
     const isK = grade === "K";
     const minWords = isK ? 30 : 0;
     const maxWords = isK ? 60 : springWCPM50[grade] * 5; // ≤ 5 minutes
+    const targetWpm = isK ? 40 : springWCPM50[grade];    // K default
 
-    const targetWpm = isK ? 40 : springWCPM50[grade]; // K is a reasonable default (no H&T K norm published)
+    const prompt = buildStoryPrompt({ squishName, grade, theme, minWords, maxWords, seed });
 
-    const prompt = buildStoryPrompt({
-      squishName,
-      grade,
-      theme,
-      minWords,
-      maxWords,
-      seed,
-    });
+    // ----- FIRST TRY -----
+    let parsed = await callClaudeForStoryJSON(env, MODEL_ID, prompt, 0.7);
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: MODEL_ID,
-        max_tokens: 800,
-        temperature: 0.7,
-        messages: [
-          {
-            role: "user",
-            content: [{ type: "text", text: prompt }],
-          },
-        ],
-      }),
-    });
+    // If parse failed, retry once (handled inside helper by throwing)
+    if (!parsed) {
+      const retryPrompt = prompt + `
+IMPORTANT FIX:
+- Return ONLY JSON (not inside quotes).
+- Do NOT wrap JSON in a string.
+- Do NOT use markdown or code fences.
+- Keep story_text as a normal string (no real line breaks; use \\n if needed).`;
 
-    if (!response.ok) {
-      const text = await response.text();
-      return json({ error: "Claude API error", details: text }, 500);
+      parsed = await callClaudeForStoryJSON(env, MODEL_ID, retryPrompt, 0.2);
     }
 
-    const result = await response.json();
-    
-const textBlock = result.content?.[0]?.text || "";
-const extracted = extractJson(textBlock);
-
-let parsed;
-try {
-  parsed = JSON.parse(extracted);
-} catch {
-  // Retry once with stricter instruction + lower temperature
-  const retryPrompt =
-    prompt +
-    `\n\nYOUR LAST OUTPUT WAS NOT VALID JSON. Fix it now.
-Return ONE-LINE JSON ONLY. No line breaks. Use \\n inside story_text if needed.`;
-
-  const retryRes = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: MODEL_ID,
-      max_tokens: 800,
-      temperature: 0.2, // lower = more obedient formatting
-      messages: [{ role: "user", content: [{ type: "text", text: retryPrompt }] }],
-    }),
-  });
-
-  if (!retryRes.ok) {
-    const t = await retryRes.text();
-    return json({ error: "Claude retry API error", details: t }, 500);
-  }
-
-  const retryJson = await retryRes.json();
-  const retryText = retryJson.content?.[0]?.text || "";
-  const retryExtracted = extractJson(retryText);
-
-  try {
-    parsed = JSON.parse(retryExtracted);
-  } catch {
-    return json(
-      { error: "Could not parse story JSON (after retry)", raw: retryText, extracted: retryExtracted },
-      500
-    );
-  }
-}
-
-
-    // Server-side enforce word count
+    // ---- Server-side enforce word count ----
     const storyText = (parsed.story_text || "").trim();
     const title = (parsed.story_title || "Your Story").trim();
     const tip = (parsed.reading_tip || "").trim();
 
     const wordCount = countWords(storyText);
 
-    // Enforce caps (regenerate flow later; for now, trim if too long)
     let finalText = storyText;
     let finalWordCount = wordCount;
 
     if (finalWordCount > maxWords) {
       finalText = trimToMaxWords(finalText, maxWords);
       finalWordCount = countWords(finalText);
-    }
-
-    if (isK && finalWordCount < minWords) {
-      // If too short, just keep it; we’ll improve with regenerate logic later.
-      // (Claude usually respects 30–60.)
     }
 
     const recommendedSeconds = Math.ceil((finalWordCount / targetWpm) * 60);
@@ -324,6 +238,7 @@ function buildStoryPrompt({ squishName, grade, theme, minWords, maxWords, seed }
 
   return `Return ONLY valid JSON on a SINGLE LINE.
 No markdown. No code fences. No extra text.
+Do NOT wrap the JSON in quotes.
 IMPORTANT: Do NOT include any real line breaks in the JSON.
 If you need a line break in the story, you MUST use the two characters \\n inside the story_text string.
 
@@ -341,6 +256,41 @@ Requirements:
 Respond ONLY with ONE-LINE JSON matching the schema exactly.`;
 }
 
+// ------------------------
+// Claude call helper for /story
+// ------------------------
+async function callClaudeForStoryJSON(env, modelId, prompt, temperature) {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: modelId,
+      max_tokens: 900,
+      temperature,
+      messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Claude API error: ${text}`);
+  }
+
+  const result = await response.json();
+  const textBlock = result.content?.[0]?.text || "";
+
+  try {
+    return parseClaudeJson(textBlock);
+  } catch (e) {
+    // If this is the first pass, caller may retry with stricter prompt
+    // By returning null, we allow the caller to decide whether to retry.
+    return null;
+  }
+}
 
 // ------------------------
 // Shared helpers
@@ -355,25 +305,37 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
-function extractJson(text) {
-  if (!text) return "{}";
+function parseClaudeJson(textBlock) {
+  if (!textBlock) throw new Error("Empty response from Claude");
 
-  let t = text.trim();
+  let t = textBlock.trim();
+
+  // Remove markdown fences if present
   t = t.replace(/^```json\s*/i, "").replace(/^```\s*/i, "");
   t = t.replace(/```$/i, "").trim();
 
-  if ((t.startsWith("\"{") && t.endsWith("}\"")) || (t.startsWith("'{" ) && t.endsWith("}'"))) {
-    t = t.slice(1, -1);
-    t = t.replace(/\\"/g, '"').replace(/\\n/g, "\n").replace(/\\t/g, "\t");
-  }
+  // Attempt 1: direct JSON
+  try {
+    return JSON.parse(t);
+  } catch {}
 
+  // Attempt 2: JSON wrapped as a quoted string (double-encoded)
+  // Example: "{\"story_title\":\"...\",\"story_text\":\"...\"}"
+  try {
+    const inner = JSON.parse(t);
+    if (typeof inner === "string") {
+      return JSON.parse(inner);
+    }
+  } catch {}
+
+  // Attempt 3: slice first {...} block
   const firstBrace = t.indexOf("{");
   const lastBrace = t.lastIndexOf("}");
   if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    return t.slice(firstBrace, lastBrace + 1);
+    return JSON.parse(t.slice(firstBrace, lastBrace + 1));
   }
 
-  return t;
+  throw new Error("Unable to parse JSON.");
 }
 
 function countWords(text) {
