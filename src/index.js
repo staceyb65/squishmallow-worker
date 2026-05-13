@@ -234,22 +234,54 @@ async function handleStory(request, env) {
     }
 
     const result = await response.json();
-    const textBlock = result.content?.[0]?.text || "";
-    const extracted = extractJson(textBlock);
+    
+const textBlock = result.content?.[0]?.text || "";
+const extracted = extractJson(textBlock);
 
-    let parsed;
-    try {
-      parsed = JSON.parse(extracted);
-    } catch {
-      return json(
-        {
-          error: "Could not parse story JSON",
-          raw: textBlock,
-          extracted,
-        },
-        500
-      );
-    }
+let parsed;
+try {
+  parsed = JSON.parse(extracted);
+} catch {
+  // Retry once with stricter instruction + lower temperature
+  const retryPrompt =
+    prompt +
+    `\n\nYOUR LAST OUTPUT WAS NOT VALID JSON. Fix it now.
+Return ONE-LINE JSON ONLY. No line breaks. Use \\n inside story_text if needed.`;
+
+  const retryRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: MODEL_ID,
+      max_tokens: 800,
+      temperature: 0.2, // lower = more obedient formatting
+      messages: [{ role: "user", content: [{ type: "text", text: retryPrompt }] }],
+    }),
+  });
+
+  if (!retryRes.ok) {
+    const t = await retryRes.text();
+    return json({ error: "Claude retry API error", details: t }, 500);
+  }
+
+  const retryJson = await retryRes.json();
+  const retryText = retryJson.content?.[0]?.text || "";
+  const retryExtracted = extractJson(retryText);
+
+  try {
+    parsed = JSON.parse(retryExtracted);
+  } catch {
+    return json(
+      { error: "Could not parse story JSON (after retry)", raw: retryText, extracted: retryExtracted },
+      500
+    );
+  }
+}
+
 
     // Server-side enforce word count
     const storyText = (parsed.story_text || "").trim();
@@ -290,25 +322,25 @@ async function handleStory(request, env) {
 function buildStoryPrompt({ squishName, grade, theme, minWords, maxWords, seed }) {
   const gradeLabel = grade === "K" ? "Pre-reader (Kindergarten)" : `Grade ${grade}`;
 
-  return `Return ONLY valid JSON. No markdown, no code fences, no extra text.
+  return `Return ONLY valid JSON on a SINGLE LINE.
+No markdown. No code fences. No extra text.
+IMPORTANT: Do NOT include any real line breaks in the JSON.
+If you need a line break in the story, you MUST use the two characters \\n inside the story_text string.
 
 Use this exact JSON schema:
-{
-  "story_title": string,
-  "story_text": string,
-  "reading_tip": string
-}
+{"story_title": string, "story_text": string, "reading_tip": string}
 
 Requirements:
-- The Squishmallow named "${squishName}" MUST be the main character in the story.
+- The Squishmallow named "${squishName}" MUST be the main character.
 - Theme: "${theme}".
 - Reading level: ${gradeLabel}.
 - Total story length must be between ${minWords} and ${maxWords} words.
-- Keep it positive and kid-friendly.
+- Kid-friendly and positive.
 - Make this version different using this seed: ${seed}
 
-Remember: Respond ONLY with JSON matching the schema.`;
+Respond ONLY with ONE-LINE JSON matching the schema exactly.`;
 }
+
 
 // ------------------------
 // Shared helpers
