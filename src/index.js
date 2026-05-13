@@ -13,12 +13,14 @@ export default {
       if (!env.ANTHROPIC_API_KEY) {
         return json({ error: "Missing ANTHROPIC_API_KEY secret." }, 500);
       }
+
       const r = await fetch("https://api.anthropic.com/v1/models", {
         headers: {
           "x-api-key": env.ANTHROPIC_API_KEY,
           "anthropic-version": "2023-06-01",
         },
       });
+
       const text = await r.text();
       return new Response(text, {
         status: r.status,
@@ -191,16 +193,30 @@ async function handleStory(request, env) {
     // ----- FIRST TRY -----
     let parsed = await callClaudeForStoryJSON(env, MODEL_ID, prompt, 0.7);
 
-    // If parse failed, retry once (handled inside helper by throwing)
+    // ----- RETRY ONCE -----
     if (!parsed) {
-      const retryPrompt = prompt + `
-IMPORTANT FIX:
+      const retryPrompt =
+        prompt +
+        `
+
+YOUR LAST OUTPUT WAS NOT VALID JSON. Fix it now:
 - Return ONLY JSON (not inside quotes).
 - Do NOT wrap JSON in a string.
-- Do NOT use markdown or code fences.
-- Keep story_text as a normal string (no real line breaks; use \\n if needed).`;
+- No markdown or code fences.
+- ONE LINE ONLY. No real line breaks. Use \\n inside story_text if needed.`;
 
       parsed = await callClaudeForStoryJSON(env, MODEL_ID, retryPrompt, 0.2);
+    }
+
+    // ✅ NEW: if still null, return a clean error (no crash)
+    if (!parsed || typeof parsed !== "object" || typeof parsed.story_text !== "string") {
+      return json(
+        {
+          error: "Could not parse story JSON (after retry)",
+          hint: "Claude returned non-JSON twice. Try Regenerate, or we can tighten constraints further."
+        },
+        500
+      );
     }
 
     // ---- Server-side enforce word count ----
@@ -258,6 +274,7 @@ Respond ONLY with ONE-LINE JSON matching the schema exactly.`;
 
 // ------------------------
 // Claude call helper for /story
+// Returns an object or null (never throws for parse issues)
 // ------------------------
 async function callClaudeForStoryJSON(env, modelId, prompt, temperature) {
   const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -284,10 +301,14 @@ async function callClaudeForStoryJSON(env, modelId, prompt, temperature) {
   const textBlock = result.content?.[0]?.text || "";
 
   try {
-    return parseClaudeJson(textBlock);
-  } catch (e) {
-    // If this is the first pass, caller may retry with stricter prompt
-    // By returning null, we allow the caller to decide whether to retry.
+    const parsed = parseClaudeJson(textBlock);
+
+    // Guard against "null" or weird shapes
+    if (!parsed || typeof parsed !== "object") return null;
+    if (typeof parsed.story_text !== "string") return null;
+
+    return parsed;
+  } catch {
     return null;
   }
 }
